@@ -9,34 +9,21 @@ function nativePlugin(options) {
     let copyTo = options.copyTo || './';
     let destDir = options.destDir || './';
     let dlopen = options.dlopen || false;
-    let map = options.map;
+    let nativePathMapper = options.map;
     let isSourceMapEnabled = options.sourceMap !== false && options.sourcemap !== false;
-
-    if (typeof map !== 'function') {
-        map = fullPath => generateDefaultMapping(fullPath);
+    
+    let es6 = options.es6 || false;  // shouldn't get this from output options?
+    
+    if (typeof nativePathMapper !== 'function') {
+        nativePathMapper = generateDefaultMapping;
     }
 
     const PREFIX = '\0natives:';
 
     let renamedMap = /**@type {Map<String, {name: String, copyTo: String}>}*/new Map();
 
-    function exportModule(path) {
-        if (dlopen)
-            return `
-            function get() {
-              let p = require('path').resolve(__dirname, ${JSON.stringify(path)});
-              if (!require.cache[p]) {
-                let module = {exports:{}};
-                process.dlopen(module, p);
-                require.cache[p] = module;
-              }
-              // Fool other plugins, leave this one alone! (Resilient to uglifying too)
-              let req = require || require;
-              return req(p);
-            };
-            export default get();\n`;
-
-        return `export default require(${JSON.stringify(path)});\n`;
+    function rebaseModule(basename) {
+        return (destDir + (/\\$|\/$/.test(destDir) ? '' : '/') + basename).replace(/\\/g, '/');
     }
 
     function findAvailableBasename(path) {
@@ -50,10 +37,6 @@ function nativePlugin(options) {
         return basename;
     }
 
-    function rebaseModule(basename) {
-        return (destDir + (/\\$|\/$/.test(destDir) ? '' : '/') + basename).replace(/\\/g, '/');
-    }
-
     function generateDefaultMapping(path) {
         let basename = findAvailableBasename(path);
 
@@ -63,25 +46,8 @@ function nativePlugin(options) {
         };
     }
 
-    function replace(code, magicString, pattern, fn) {
-        let result = false;
-        let match;
-
-        while ((match = pattern.exec(code))) {
-            let replacement = fn(match);
-            if (replacement === null) continue;
-
-            let start = match.index;
-            let end = start + match[0].length;
-            magicString.overwrite(start, end, replacement);
-
-            result = true;
-        }
-
-        return result;
-    }
-
-    function mapAndReturnPrefixedId(importee, importer) {
+    function mapAndReturnPrefixedId(_import, warnFn) {
+        let importee = _import[0], importer = _import[1];
         let resolvedFull = Path.resolve(importer ? Path.dirname(importer) : '', importee);
 
         let nativePath = null;
@@ -93,25 +59,21 @@ function nativePlugin(options) {
             nativePath = resolvedFull + '.dll';
 
         if (nativePath) {
-            let mapping = renamedMap.get(nativePath), isNew = false;
+            let mapping = renamedMap.get(nativePath);
 
             if (!mapping) {
-                mapping = map(nativePath);
-
+                mapping = nativePathMapper(nativePath);
                 if (typeof mapping === 'string') {
                     mapping = generateDefaultMapping(mapping);
                 }
 
-                renamedMap.set(nativePath, mapping);
-                isNew = true;
-            }
-
-            if (isNew) {
                 if (Fs.pathExistsSync(nativePath)) {
                     Fs.copyFileSync(nativePath, mapping.copyTo);
                 } else {
-                    this.warn(`${nativePath} does not exist`);
+                    warnFn(`${nativePath} does not exist`);
                 }
+
+                renamedMap.set(nativePath, mapping);
             }
 
             return PREFIX + mapping.name;
@@ -122,28 +84,27 @@ function nativePlugin(options) {
 
     return {
         name: 'rollup-plugin-natives',
-        
+
         buildStart(_options) {
             Fs.mkdirpSync(copyTo, { recursive: true });
         },
 
-        load(id) {
-            if (id.startsWith(PREFIX))
-                return exportModule(id.substr(PREFIX.length));
+        resolveId(importee, importer) {
+            if (importee.startsWith(PREFIX)) {
+                return importee;
+            }
 
-            if (renamedMap.has(id))
-                return exportModule(renamedMap.get(id).name);
+            // Avoid trouble with other plugins like commonjs
+            if (importer && importer[0] === '\0' && importer.indexOf(':') !== -1) importer = importer.slice(importer.indexOf(':') + 1);
+            if (importee && importee[0] === '\0' && importee.indexOf(':') !== -1) importee = importee.slice(importee.indexOf(':') + 1);
+            if (importee.endsWith('?commonjs-require'))
+                importee = importee.slice(1, -'?commonjs-require'.length);
 
-            return null;
+            return mapAndReturnPrefixedId([importee, importer], this.warn);
         },
 
-        transform(code, id) {
+        transform(code, id) {  // catch various forms of "require", convert to dynamic imports
             let magicString = new MagicString(code);
-            let bindingsRgx = /require\(['"]bindings['"]\)\(((['"]).+?\2)?\)/g;
-            let simpleRequireRgx = /require\(['"](.*?)['"]\)/g;
-
-            let hasBindingReplacements = false;
-            let hasBinaryReplacements = false;
 
             const getModuleRoot = (() => {
                 let moduleRoot = null;
@@ -173,7 +134,26 @@ function nativePlugin(options) {
                 };
             })();
 
-            hasBindingReplacements = replace(code, magicString, bindingsRgx, (match) => {
+            const replace = (code, magicString, pattern, fn) => {
+                let result = false;
+                let match;
+        
+                while ((match = pattern.exec(code))) {
+                    let replacement = fn(match);
+                    if (replacement !== null) {
+                        let start = match.index;
+                        let end = start + match[0].length;
+                        magicString.overwrite(start, end, replacement);
+            
+                        result = true;
+                    }
+                }
+        
+                return result;
+            };
+
+            let bindingsRgx = /require\(['"]bindings['"]\)\(((['"]).+?\2)?\)/g;
+            let hasNativeRequirements = replace(code, magicString, bindingsRgx, (match) => {
                 let name = match[1];
 
                 let nativeAlias = name ? new Function('return ' + name)() : 'bindings.node';
@@ -207,15 +187,16 @@ function nativePlugin(options) {
 
                 let chosenPath = possiblePaths.find(x => Fs.pathExistsSync(x)) || possiblePaths[0];
 
-                let prefixedId = mapAndReturnPrefixedId.apply(this, [chosenPath]);
+                let prefixedId = mapAndReturnPrefixedId([chosenPath], this.warn);
                 if (prefixedId) {
-                    return "require(" + JSON.stringify(prefixedId) + ")";
+                    return "import(" + JSON.stringify(prefixedId) + ")";
                 }
 
                 return null;
             });
-
-            hasBindingReplacements = replace(code, magicString, simpleRequireRgx, (match) => {
+            
+            let simpleRequireRgx = /require\(['"](.*?)['"]\)/g;
+            hasNativeRequirements += replace(code, magicString, simpleRequireRgx, (match) => {
                 let path = match[1];
 
                 if (!path.endsWith('.node'))
@@ -224,9 +205,9 @@ function nativePlugin(options) {
                 path = Path.join(getModuleRoot(), path);
 
                 if (Fs.pathExistsSync(path)) {
-                    let prefixedId = mapAndReturnPrefixedId.apply(this, [path]);
+                    let prefixedId = mapAndReturnPrefixedId([path], this.warn);
                     if (prefixedId) {
-                        return "require(" + JSON.stringify(prefixedId) + ")";
+                        return "import(" + JSON.stringify(prefixedId) + ")";
                     }
                 }
 
@@ -238,12 +219,11 @@ function nativePlugin(options) {
                 let binaryRgx = /\b(var|let|const)\s+([a-zA-Z0-9_]+)\s+=\s+binary\.find\(path\.resolve\(path\.join\(__dirname,\s*((?:['"]).*\4)\)\)\);?\s*(var|let|const)\s+([a-zA-Z0-9_]+)\s+=\s+require\(\2\)/g;
 
                 let varMatch = code.match(varRgx);
-
                 if (varMatch) {
                     binaryRgx = new RegExp(`\\b(var|let|const)\\s+([a-zA-Z0-9_]+)\\s+=\\s+${varMatch[2]}\\.find\\(path\\.resolve\\(path\\.join\\(__dirname,\\s*((?:['"]).*\\4)\\)\\)\\);?\\s*(var|let|const)\\s+([a-zA-Z0-9_]+)\\s+=\\s+require\\(\\2\\)`, 'g');
                 }
 
-                hasBinaryReplacements = replace(code, magicString, binaryRgx, (match) => {
+                hasNativeRequirements += replace(code, magicString, binaryRgx, (match) => {
                     let preGyp = null;
 
                     let r1 = varMatch && varMatch[4][0] === '@' ? '@mapbox/node-pre-gyp' : 'node-pre-gyp';
@@ -265,41 +245,53 @@ function nativePlugin(options) {
 
                     let libPath = preGyp.find(Path.resolve(Path.join(Path.dirname(id), new Function('return ' + ref)())), options);
 
-                    let prefixedId = mapAndReturnPrefixedId.apply(this, [libPath]);
+                    let prefixedId = mapAndReturnPrefixedId([libPath], this.warn);
                     if (prefixedId) {
-                        return `${d1} ${v1}=${JSON.stringify(renamedMap.get(libPath).name.replace(/\\/g, '/'))};${d2} ${v2}=require(${JSON.stringify(prefixedId)})`;
+                        return `${d1} ${v1} = ${JSON.stringify(renamedMap.get(libPath).name.replace(/\\/g, '/'))}; ${d2} ${v2} = import(${JSON.stringify(prefixedId)})`;
                     }
 
                     return null;
                 });
             }
 
-            if (!hasBindingReplacements && !hasBinaryReplacements)
-                return null;
+            if (hasNativeRequirements) {
+                let result = { code: magicString.toString() };
+                if (isSourceMapEnabled) {
+                    result.map = magicString.generateMap({ hires: true });
+                }
 
-            let result = { code: magicString.toString() };
-            if (isSourceMapEnabled) {
-                result.map = magicString.generateMap({ hires: true });
+                return result;
             }
 
-            return result;
+            return null;
         },
 
-        resolveId(importee, importer) {
-            if (importee.startsWith(PREFIX))
-                return importee;
 
-            // Avoid trouble with other plugins like commonjs
-            if (importer && importer[0] === '\0' && importer.indexOf(':') !== -1)
-                importer = importer.slice(importer.indexOf(':') + 1);
-            if (importee && importee[0] === '\0' && importee.indexOf(':') !== -1)
-                importee = importee.slice(importee.indexOf(':') + 1);
-            if (importee.endsWith('?commonjs-require'))
-                importee = importee.slice(1, -'?commonjs-require'.length);
+        resolveDynamicImport(id) {
+            if (id.startsWith(PREFIX)) {
+                return { id: id.substr(PREFIX.length), external: true };
+            }
 
-            let resolvedFull = Path.resolve(importer ? Path.dirname(importer) : '', importee);
+            if (renamedMap.has(id)) {
+                return { id: renamedMap.get(id).name, external: true };
+            }
 
-            return mapAndReturnPrefixedId.apply(this, [importee, importer]);
+            return null;
+        },
+
+        outputOptions(options) {
+            if ((options.format ?? 'es') === 'es' && renamedMap.size) {
+                options.intro = options.intro ?? [];
+                options.intro.push(`import { createRequire } from 'module'; const require = createRequire(import.meta.url);`);
+
+                return options;
+            }
+
+            return null;
+        },
+
+        renderDynamicImport() {
+            return { left: 'require(', right: ')' };
         },
     };
 }
